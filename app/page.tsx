@@ -74,8 +74,9 @@ export default function Dashboard() {
   const [groupResults, setGroupResults] = useState<GroupSearchResult[]>([]);
   const [groupSearchLoading, setGroupSearchLoading] = useState(false);
   const [groupSearchError, setGroupSearchError] = useState("");
-  const [groupJoinLoading, setGroupJoinLoading] = useState<Record<string, boolean>>({});
-  const [groupJoinStatus, setGroupJoinStatus] = useState<Record<string, string>>({});
+  const [groupJoinLoading, setGroupJoinLoading] = useState<Record<string, boolean>>({}); // per groupUrl
+  const [groupJoinStatus, setGroupJoinStatus] = useState<Record<string, Record<string, string>>>({}); // groupUrl → accountId → status
+  const [groupSelectedAccounts, setGroupSelectedAccounts] = useState<Set<string>>(new Set());
   const [groupHistory, setGroupHistory] = useState<GroupJoinRecord[]>([]);
 
   // Queue tab state
@@ -95,6 +96,7 @@ export default function Dashboard() {
         const accs: Account[] = data.accounts ?? [];
         setAccounts(accs);
         if (accs.length > 0) setSelectedId(accs[0].id);
+        setGroupSelectedAccounts(new Set(accs.map((a) => a.id)));
         // load session info for all accounts
         const map: Record<string, SessionInfo> = {};
         await Promise.all(accs.map(async (acc) => {
@@ -352,26 +354,34 @@ export default function Dashboard() {
   }
 
   async function doJoinGroup(group: GroupSearchResult) {
+    const targets = accounts.filter((a) => groupSelectedAccounts.has(a.id));
+    if (targets.length === 0) return;
+
     setGroupJoinLoading((s) => ({ ...s, [group.url]: true }));
-    try {
-      const res = await fetch("/api/groups/join", {
-        method: "POST",
-        headers: { "Content-Type": "application/json" },
-        body: JSON.stringify({ groupUrl: group.url, groupName: group.name, accountId: selectedId }),
-      });
-      const data = await res.json();
-      if (!data.success) throw new Error(data.error);
-      setGroupJoinStatus((s) => ({ ...s, [group.url]: data.status }));
-      // refresh history
-      fetch("/api/groups/history")
-        .then((r) => r.json())
-        .then((d) => setGroupHistory(d.records ?? []));
-    } catch (e: unknown) {
-      setGroupJoinStatus((s) => ({ ...s, [group.url]: "error" }));
-      alert(e instanceof Error ? e.message : "เกิดข้อผิดพลาด");
-    } finally {
-      setGroupJoinLoading((s) => ({ ...s, [group.url]: false }));
+
+    for (const acc of targets) {
+      try {
+        const res = await fetch("/api/groups/join", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ groupUrl: group.url, groupName: group.name, accountId: acc.id }),
+        });
+        const data = await res.json();
+        const status = data.success ? data.status : "error";
+        setGroupJoinStatus((s) => ({
+          ...s,
+          [group.url]: { ...(s[group.url] ?? {}), [acc.id]: status },
+        }));
+      } catch {
+        setGroupJoinStatus((s) => ({
+          ...s,
+          [group.url]: { ...(s[group.url] ?? {}), [acc.id]: "error" },
+        }));
+      }
     }
+
+    setGroupJoinLoading((s) => ({ ...s, [group.url]: false }));
+    fetch("/api/groups/history").then((r) => r.json()).then((d) => setGroupHistory(d.records ?? []));
   }
 
   const selectedAccount = accounts.find((a) => a.id === selectedId);
@@ -757,6 +767,42 @@ export default function Dashboard() {
             {groupSearchError && <p className="text-red-400 text-sm">❌ {groupSearchError}</p>}
           </div>
 
+          {/* Account selector — shown when 2+ accounts exist */}
+          {accounts.length > 1 && (
+            <div className="bg-gray-900 border border-gray-800 rounded-xl p-4 space-y-2">
+              <p className="text-xs text-gray-400">เลือกบัญชีที่จะใช้ Join กลุ่ม</p>
+              <div className="flex flex-wrap gap-2">
+                {accounts.map((acc) => {
+                  const checked = groupSelectedAccounts.has(acc.id);
+                  return (
+                    <button
+                      key={acc.id}
+                      onClick={() =>
+                        setGroupSelectedAccounts((prev) => {
+                          const next = new Set(prev);
+                          if (checked) next.delete(acc.id); else next.add(acc.id);
+                          return next;
+                        })
+                      }
+                      className={`flex items-center gap-2 px-3 py-1.5 rounded-lg text-sm border transition ${
+                        checked
+                          ? "bg-blue-900/50 border-blue-600 text-blue-300"
+                          : "bg-gray-800 border-gray-700 text-gray-500 hover:border-gray-500"
+                      }`}
+                    >
+                      <span className={`w-3.5 h-3.5 rounded border flex items-center justify-center text-xs shrink-0 ${
+                        checked ? "bg-blue-500 border-blue-500 text-white" : "border-gray-600"
+                      }`}>
+                        {checked ? "✓" : ""}
+                      </span>
+                      👤 {acc.label}
+                    </button>
+                  );
+                })}
+              </div>
+            </div>
+          )}
+
           {/* Results block — always visible, content changes by state */}
           <div className="bg-gray-900 border border-gray-800 rounded-xl overflow-hidden">
             {/* Loading */}
@@ -785,70 +831,95 @@ export default function Dashboard() {
                   <p className="text-xs text-gray-400">พบ <span className="text-white font-medium">{groupResults.length}</span> กลุ่มที่ใกล้เคียง</p>
                 </div>
                 {groupResults.map((g, i) => {
-                  const joined = groupJoinStatus[g.url];
+                  const statusMap = groupJoinStatus[g.url] ?? {};
                   const loading = groupJoinLoading[g.url] ?? false;
                   const alreadyInHistory = groupHistory.some((h) => h.group_url === g.url);
+                  const selectedAccList = accounts.filter((a) => groupSelectedAccounts.has(a.id));
+                  const completedAccs = selectedAccList.filter((a) => statusMap[a.id]);
+                  const allDone = selectedAccList.length > 0 && completedAccs.length === selectedAccList.length;
+
+                  function statusBadge(s: string) {
+                    const cls =
+                      s === "request_sent"   ? "bg-yellow-900/50 text-yellow-400 border-yellow-700" :
+                      s === "joined"         ? "bg-green-900/50  text-green-400  border-green-700"  :
+                      s === "already_member" ? "bg-blue-900/50   text-blue-400   border-blue-700"   :
+                                              "bg-red-900/50    text-red-400    border-red-700";
+                    const label =
+                      s === "request_sent"   ? "รอ Approve" :
+                      s === "joined"         ? "เข้าร่วมแล้ว" :
+                      s === "already_member" ? "เป็นสมาชิกอยู่แล้ว" : "ไม่สำเร็จ";
+                    return { cls, label };
+                  }
+
                   return (
                     <div
                       key={g.url}
-                      className={`flex items-center gap-3 px-4 py-3 hover:bg-gray-800/50 transition ${i > 0 ? "border-t border-gray-800" : ""}`}
+                      className={`px-4 py-3 hover:bg-gray-800/50 transition ${i > 0 ? "border-t border-gray-800" : ""}`}
                     >
-                      {/* Avatar */}
-                      <div className="w-9 h-9 rounded-full bg-blue-900 flex items-center justify-center text-base shrink-0 select-none">
-                        👥
-                      </div>
+                      <div className="flex items-center gap-3">
+                        {/* Avatar */}
+                        <div className="w-9 h-9 rounded-full bg-blue-900 flex items-center justify-center text-base shrink-0 select-none">
+                          👥
+                        </div>
 
-                      {/* Info */}
-                      <div className="flex-1 min-w-0">
-                        <p className="text-sm font-medium text-white truncate">{g.name}</p>
-                        <div className="flex items-center gap-2 mt-0.5 flex-wrap">
-                          {g.privacy && (
-                            <span className="text-xs text-gray-500">
-                              {g.privacy === "public" ? "🌐 สาธารณะ" : "🔒 ส่วนตัว"}
-                            </span>
-                          )}
-                          {g.memberCount && (
-                            <span className="text-xs text-gray-500">· {g.memberCount} สมาชิก</span>
-                          )}
-                          {alreadyInHistory && !joined && (
-                            <span className="text-xs text-yellow-600">· เคยขอแล้ว</span>
+                        {/* Info */}
+                        <div className="flex-1 min-w-0">
+                          <p className="text-sm font-medium text-white truncate">{g.name}</p>
+                          <div className="flex items-center gap-2 mt-0.5 flex-wrap">
+                            {g.privacy && (
+                              <span className="text-xs text-gray-500">
+                                {g.privacy === "public" ? "🌐 สาธารณะ" : "🔒 ส่วนตัว"}
+                              </span>
+                            )}
+                            {g.memberCount && (
+                              <span className="text-xs text-gray-500">· {g.memberCount} สมาชิก</span>
+                            )}
+                            {alreadyInHistory && completedAccs.length === 0 && (
+                              <span className="text-xs text-yellow-600">· เคยขอแล้ว</span>
+                            )}
+                          </div>
+                        </div>
+
+                        {/* Action */}
+                        <div className="flex items-center gap-2 shrink-0">
+                          <a
+                            href={g.url}
+                            target="_blank"
+                            rel="noopener noreferrer"
+                            className="text-gray-600 hover:text-blue-400 transition text-sm"
+                            title="ดูกลุ่ม"
+                          >
+                            🔗
+                          </a>
+                          {loading ? (
+                            <span className="text-xs text-gray-400 animate-pulse whitespace-nowrap">⏳ กำลัง Join...</span>
+                          ) : allDone ? (
+                            <span className="text-xs text-gray-500 whitespace-nowrap">✓ เสร็จแล้ว</span>
+                          ) : (
+                            <button
+                              onClick={() => doJoinGroup(g)}
+                              disabled={groupSelectedAccounts.size === 0}
+                              className="text-xs bg-blue-600 hover:bg-blue-700 disabled:opacity-40 disabled:cursor-not-allowed text-white px-4 py-1.5 rounded-lg font-medium transition whitespace-nowrap"
+                            >
+                              ขอเข้าร่วม{groupSelectedAccounts.size > 1 ? ` (${groupSelectedAccounts.size})` : ""}
+                            </button>
                           )}
                         </div>
                       </div>
 
-                      {/* Actions */}
-                      <div className="flex items-center gap-2 shrink-0">
-                        <a
-                          href={g.url}
-                          target="_blank"
-                          rel="noopener noreferrer"
-                          className="text-gray-600 hover:text-blue-400 transition text-sm"
-                          title="ดูกลุ่ม"
-                        >
-                          🔗
-                        </a>
-                        {joined ? (
-                          <span className={`text-xs px-3 py-1.5 rounded-lg font-medium whitespace-nowrap ${
-                            joined === "request_sent" ? "bg-yellow-900/50 text-yellow-400 border border-yellow-700" :
-                            joined === "joined"       ? "bg-green-900/50  text-green-400  border border-green-700"  :
-                            joined === "already_member" ? "bg-blue-900/50 text-blue-400   border border-blue-700"   :
-                                                          "bg-red-900/50   text-red-400    border border-red-700"
-                          }`}>
-                            {joined === "request_sent"   ? "⏳ รอ Approve" :
-                             joined === "joined"         ? "✅ เข้าร่วมแล้ว" :
-                             joined === "already_member" ? "✓ เป็นสมาชิกอยู่แล้ว" :
-                                                          "❌ ไม่สำเร็จ"}
-                          </span>
-                        ) : (
-                          <button
-                            onClick={() => doJoinGroup(g)}
-                            disabled={loading || !selectedId}
-                            className="text-xs bg-blue-600 hover:bg-blue-700 disabled:opacity-50 disabled:cursor-not-allowed text-white px-4 py-1.5 rounded-lg font-medium transition whitespace-nowrap"
-                          >
-                            {loading ? "⏳" : "ขอเข้าร่วม"}
-                          </button>
-                        )}
-                      </div>
+                      {/* Per-account status — shown after joining */}
+                      {completedAccs.length > 0 && (
+                        <div className="mt-2 ml-12 flex flex-wrap gap-1.5">
+                          {completedAccs.map((acc) => {
+                            const { cls, label } = statusBadge(statusMap[acc.id]);
+                            return (
+                              <span key={acc.id} className={`text-xs px-2 py-0.5 rounded-full border ${cls}`}>
+                                👤 {acc.label}: {label}
+                              </span>
+                            );
+                          })}
+                        </div>
+                      )}
                     </div>
                   );
                 })}
