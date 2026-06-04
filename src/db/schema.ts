@@ -86,6 +86,17 @@ export const schema = `
     ON logs(job_id);
   CREATE INDEX IF NOT EXISTS idx_review_queue_status
     ON review_queue(status);
+
+  CREATE TABLE IF NOT EXISTS group_join_history (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    group_name   TEXT    NOT NULL,
+    group_url    TEXT    NOT NULL,
+    status       TEXT    NOT NULL DEFAULT 'request_sent',
+    requested_at TEXT    NOT NULL DEFAULT (datetime('now'))
+  );
+
+  CREATE INDEX IF NOT EXISTS idx_group_join_url
+    ON group_join_history(group_url);
 `
 
 export const seedTemplates = `

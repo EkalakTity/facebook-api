@@ -5,8 +5,9 @@ import { askSelect } from './prompt'
 import { runNewJobSetup } from './new-job.flow'
 import { showReviewQueue } from './review-queue.view'
 import { showLogViewer } from './log-viewer.view'
+import { showGroupJoinView } from './group-join.view'
 
-type MenuChoice = 'new_job' | 'review_queue' | 'logs' | 'exit'
+type MenuChoice = 'new_job' | 'review_queue' | 'join_group' | 'logs' | 'exit'
 
 function getPendingCount(): number {
   const row = db
@@ -41,6 +42,7 @@ export async function showMainMenu(): Promise<void> {
     const choice = await askSelect<MenuChoice>('เลือกการทำงาน:', [
       { name: 'เริ่มงานใหม่',                          value: 'new_job' },
       { name: queueLabel,                               value: 'review_queue' },
+      { name: 'ขอเข้ากลุ่ม Facebook',                  value: 'join_group' },
       { name: 'ดู Log ล่าสุด',                          value: 'logs' },
       { name: chalk.gray('ออกจากโปรแกรม'),              value: 'exit' },
     ])
@@ -54,6 +56,11 @@ export async function showMainMenu(): Promise<void> {
 
       case 'review_queue':
         await showReviewQueue()
+        await pause()
+        break
+
+      case 'join_group':
+        await showGroupJoinView()
         await pause()
         break
 
