@@ -555,10 +555,12 @@ export async function searchGroups(query: string, accountId: string): Promise<Gr
   const { browser, page } = await launchBrowser(accountId, headless)
   try {
     await ensureLoggedIn(page, accountId)
+    // domcontentloaded + manual wait — networkidle2 never settles on Facebook search
     await page.goto(`https://www.facebook.com/search/groups/?q=${encodeURIComponent(query)}`, {
-      waitUntil: 'networkidle2',
+      waitUntil: 'domcontentloaded',
+      timeout: 30000,
     })
-    await new Promise((r) => setTimeout(r, 2000))
+    await new Promise((r) => setTimeout(r, 4000))
 
     const raw = await page.$$eval('[role="article"]', (articles) => {
       const SKIP = ['discover', 'feed', 'notifications', 'search', 'join']
@@ -571,7 +573,9 @@ export async function searchGroups(query: string, accountId: string): Promise<Gr
           if (!match || SKIP.includes(match[1])) continue
           if (!groupUrl) {
             groupUrl = `https://www.facebook.com/groups/${match[1]}`
-            groupName = link.textContent?.trim() ?? ''
+            // Walk up to the article to find the heading/span with the group name
+            const heading = article.querySelector('span[dir="auto"]')
+            groupName = heading?.textContent?.trim() || link.textContent?.trim() || ''
           }
         }
         if (!groupUrl || !groupName) return null
@@ -599,8 +603,8 @@ export async function joinGroup(groupUrl: string, accountId: string): Promise<Gr
   const { browser, page } = await launchBrowser(accountId, headless)
   try {
     await ensureLoggedIn(page, accountId)
-    await page.goto(groupUrl, { waitUntil: 'networkidle2' })
-    await new Promise((r) => setTimeout(r, 2500))
+    await page.goto(groupUrl, { waitUntil: 'domcontentloaded', timeout: 30000 })
+    await new Promise((r) => setTimeout(r, 4000))
 
     const bodyText: string = await page.evaluate(() => document.body.textContent ?? '')
     if (/ออกจากกลุ่ม|Leave group/i.test(bodyText)) return 'already_member'
