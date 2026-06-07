@@ -29,6 +29,28 @@ export interface Account {
   profile_url?: string;
 }
 
+export type Phase1Config =
+  | { type: "scroll_feed"; criteria: string[] }
+  | { type: "search_posts"; query: string; criteria: string[] }
+  | { type: "search_groups"; query: string }
+  | { type: "direct_url"; url: string; criteria: string[] };
+
+export type Phase2Config =
+  | { type: "comment"; text: string; criteriaId?: number }
+  | { type: "join_group" }
+  | { type: "like" };
+
+export interface PipelineJob {
+  id: string;
+  name: string;
+  accountId: string;
+  phase1: Phase1Config;
+  phase2: Phase2Config;
+  enabled: boolean;
+  intervalHours: number;
+  lastRunAt?: string;
+}
+
 export interface Settings {
   accounts: Account[];
   headless: boolean;
@@ -36,6 +58,7 @@ export interface Settings {
   scroll_speed_ms: number;
   keywords: string[];
   auto_comment_text: string;
+  pipeline_jobs?: PipelineJob[];
 }
 
 export interface AutoProgressEvent {
@@ -641,6 +664,402 @@ export async function joinGroup(groupUrl: string, accountId: string): Promise<Gr
     return 'request_sent'
   } finally {
     await browser.close()
+  }
+}
+
+export async function searchPostsAndComment(
+  searchQuery: string,
+  criteria: string[],
+  commentText: string,
+  accountId: string,
+  onProgress: (event: AutoProgressEvent) => void
+): Promise<AutoResult> {
+  const { headless, max_posts, scroll_speed_ms } = loadSettings();
+  const { browser, page } = await launchBrowser(accountId, headless);
+  const stats: AutoResult = { commented: 0, skipped_keyword: 0, skipped_duplicate: 0, errors: 0 };
+
+  try {
+    await ensureLoggedIn(page, accountId);
+    const url = `https://www.facebook.com/search/posts/?q=${encodeURIComponent(searchQuery)}`;
+    await page.goto(url, { waitUntil: "domcontentloaded", timeout: 30000 });
+    await new Promise((r) => setTimeout(r, 3000));
+    onProgress({ type: "info", message: `ค้นหาโพสต์: "${searchQuery}"` });
+
+    const matchedPosts: PostResult[] = [];
+    const seenIds = new Set<string>();
+    let attempts = 0;
+
+    while (matchedPosts.length < max_posts && attempts < 30) {
+      const items = await page.$$eval(
+        '[role="article"]',
+        (articles) => articles.map((el) => {
+          const textEl = el.querySelector('[data-ad-preview="message"], [data-testid="post_message"], div[dir="auto"]');
+          const text = (textEl as HTMLElement)?.innerText?.trim() ?? el.textContent?.trim() ?? "";
+          const linkEl = el.querySelector(
+            'a[href*="/posts/"], a[href*="story_fbid"], a[href*="/permalink/"]'
+          ) as HTMLAnchorElement | null;
+          const postUrl = linkEl?.href ?? "";
+          const postId = postUrl.match(/(\d{10,})/)?.[1] ?? text.slice(0, 80);
+          return { text, url: postUrl, postId };
+        })
+      ).catch(() => [] as { text: string; url: string; postId: string }[]);
+
+      for (const item of items) {
+        if (!item.text || item.text.length < 10 || seenIds.has(item.postId)) continue;
+        seenIds.add(item.postId);
+
+        const meetsCriteria =
+          criteria.length === 0 ||
+          criteria.some((kw) => item.text.toLowerCase().includes(kw.toLowerCase()));
+
+        if (!meetsCriteria) { stats.skipped_keyword++; continue; }
+
+        if (hasCommented(accountId, item.postId)) {
+          stats.skipped_duplicate++;
+          onProgress({ type: "skip", message: `⏭ คอมเม้นซ้ำแล้ว: "${item.text.slice(0, 60)}..."` });
+          continue;
+        }
+
+        matchedPosts.push({ postId: item.postId, url: item.url, text: item.text });
+        onProgress({ type: "found", message: `🎯 ตรงเกณฑ์: "${item.text.slice(0, 70)}..."` });
+        if (matchedPosts.length >= max_posts) break;
+      }
+
+      if (matchedPosts.length >= max_posts) break;
+      await page.evaluate(`window.scrollBy(0, 900)`);
+      await new Promise((r) => setTimeout(r, scroll_speed_ms));
+      attempts++;
+    }
+
+    onProgress({
+      type: "info",
+      message: `พบ ${matchedPosts.length} โพสต์ที่ตรงเกณฑ์ (ข้าม ${stats.skipped_keyword} ไม่ตรง, ${stats.skipped_duplicate} ซ้ำ)`,
+    });
+
+    for (const post of matchedPosts) {
+      try {
+        onProgress({ type: "commenting", message: `💬 กำลังคอมเม้น: "${post.text.slice(0, 60)}..."` });
+
+        if (!post.url) {
+          onProgress({ type: "error", message: "ข้ามโพสต์ที่ไม่มี URL" });
+          stats.errors++;
+          continue;
+        }
+
+        await page.goto(post.url, { waitUntil: "networkidle2" });
+        const commentBox = await page.$(
+          '[aria-label="แสดงความคิดเห็น..."], [aria-label="Write a comment…"], [aria-label="Write a public comment…"]'
+        );
+        if (!commentBox) throw new Error("ไม่พบ comment box");
+
+        await commentBox.click();
+        await page.keyboard.type(commentText, { delay: 60 });
+        await page.keyboard.press("Enter");
+        await new Promise((r) => setTimeout(r, 2000));
+
+        saveComment(accountId, {
+          postId: post.postId,
+          url: post.url,
+          comment: commentText,
+          commentedAt: new Date().toISOString(),
+        });
+
+        stats.commented++;
+        onProgress({ type: "success", message: `✅ คอมเม้นสำเร็จ (รวม ${stats.commented} รายการ)` });
+        await new Promise((r) => setTimeout(r, 3000 + Math.random() * 2000));
+      } catch (err) {
+        stats.errors++;
+        onProgress({ type: "error", message: `❌ ${err instanceof Error ? err.message : "unknown error"}` });
+      }
+    }
+
+    return stats;
+  } finally {
+    await browser.close();
+  }
+}
+
+// ─── Pipeline helpers (page-level, no browser management) ────────────────────
+
+async function collectPostsFromPage(
+  page: Page,
+  criteria: string[],
+  maxPosts: number,
+  scrollSpeedMs: number,
+  accountId: string,
+  stats: AutoResult,
+  onProgress: (ev: AutoProgressEvent) => void,
+): Promise<PostResult[]> {
+  const matched: PostResult[] = [];
+  const seenIds = new Set<string>();
+  let attempts = 0;
+
+  while (matched.length < maxPosts && attempts < 30) {
+    const items = await page.$$eval(
+      '[role="article"], div[data-pagelet^="FeedUnit"]',
+      (els) => els.map((el) => {
+        const textEl = el.querySelector('[data-ad-preview="message"], [data-testid="post_message"], div[dir="auto"]');
+        const text = (textEl as HTMLElement)?.innerText?.trim() ?? el.textContent?.trim() ?? "";
+        const linkEl = el.querySelector('a[href*="/posts/"], a[href*="story_fbid"], a[href*="/permalink/"]') as HTMLAnchorElement | null;
+        const postUrl = linkEl?.href ?? "";
+        const postId = postUrl.match(/(\d{10,})/)?.[1] ?? text.slice(0, 80);
+        return { text, url: postUrl, postId };
+      })
+    ).catch(() => [] as PostResult[]);
+
+    for (const item of items) {
+      if (!item.text || item.text.length < 10 || seenIds.has(item.postId)) continue;
+      seenIds.add(item.postId);
+
+      const meetsCriteria =
+        criteria.length === 0 ||
+        criteria.some((kw) => item.text.toLowerCase().includes(kw.toLowerCase()));
+
+      if (!meetsCriteria) { stats.skipped_keyword++; continue; }
+
+      if (hasCommented(accountId, item.postId)) {
+        stats.skipped_duplicate++;
+        onProgress({ type: "skip", message: `⏭ ซ้ำ: "${item.text.slice(0, 50)}..."` });
+        continue;
+      }
+
+      matched.push(item);
+      onProgress({ type: "found", message: `🎯 พบ: "${item.text.slice(0, 70)}..."` });
+      if (matched.length >= maxPosts) break;
+    }
+
+    if (matched.length >= maxPosts) break;
+    await page.evaluate(`window.scrollBy(0, 900)`);
+    await new Promise((r) => setTimeout(r, scrollSpeedMs));
+    attempts++;
+  }
+
+  return matched;
+}
+
+async function p1_scroll_feed(page: Page, criteria: string[], maxPosts: number, scrollMs: number, accountId: string, stats: AutoResult, onProgress: (ev: AutoProgressEvent) => void): Promise<PostResult[]> {
+  await page.goto("https://www.facebook.com/", { waitUntil: "networkidle2" });
+  await new Promise((r) => setTimeout(r, 2000));
+  await dismissPopups(page);
+  onProgress({ type: "info", message: "📜 Phase 1: Scroll News Feed" });
+  return collectPostsFromPage(page, criteria, maxPosts, scrollMs, accountId, stats, onProgress);
+}
+
+async function p1_search_posts(page: Page, query: string, criteria: string[], maxPosts: number, scrollMs: number, accountId: string, stats: AutoResult, onProgress: (ev: AutoProgressEvent) => void): Promise<PostResult[]> {
+  await page.goto(`https://www.facebook.com/search/posts/?q=${encodeURIComponent(query)}`, { waitUntil: "domcontentloaded", timeout: 30000 });
+  await new Promise((r) => setTimeout(r, 3000));
+  onProgress({ type: "info", message: `🔍 Phase 1: Search Posts — "${query}"` });
+  return collectPostsFromPage(page, criteria, maxPosts, scrollMs, accountId, stats, onProgress);
+}
+
+async function p1_direct_url(page: Page, url: string, criteria: string[], maxPosts: number, scrollMs: number, accountId: string, stats: AutoResult, onProgress: (ev: AutoProgressEvent) => void): Promise<PostResult[]> {
+  await page.goto(url, { waitUntil: "domcontentloaded", timeout: 30000 });
+  await new Promise((r) => setTimeout(r, 3000));
+  onProgress({ type: "info", message: `🔗 Phase 1: Direct URL — ${url}` });
+  return collectPostsFromPage(page, criteria, maxPosts, scrollMs, accountId, stats, onProgress);
+}
+
+async function p1_search_groups(page: Page, query: string, onProgress: (ev: AutoProgressEvent) => void): Promise<GroupSearchResult[]> {
+  onProgress({ type: "info", message: `🔍 Phase 1: Search Groups — "${query}"` });
+  await page.goto(`https://www.facebook.com/search/groups/?q=${encodeURIComponent(query)}`, { waitUntil: "domcontentloaded", timeout: 30000 });
+  await new Promise((r) => setTimeout(r, 4000));
+  const SKIP = ["discover", "feed", "notifications", "search", "join"];
+  const raw = await page.$$eval("[role=\"article\"]", (articles) => {
+    const SKIP_LIST = ["discover", "feed", "notifications", "search", "join"];
+    return articles.slice(0, 10).map((article) => {
+      const links = Array.from(article.querySelectorAll('a[href*="/groups/"]')) as HTMLAnchorElement[];
+      let groupUrl = "", groupName = "";
+      for (const link of links) {
+        const match = link.href.match(/facebook\.com\/groups\/([^/?#]+)/);
+        if (!match || SKIP_LIST.includes(match[1])) continue;
+        if (!groupUrl) {
+          groupUrl = `https://www.facebook.com/groups/${match[1]}`;
+          const heading = article.querySelector('span[dir="auto"]');
+          groupName = heading?.textContent?.trim() || link.textContent?.trim() || "";
+        }
+      }
+      if (!groupUrl || !groupName) return null;
+      const bodyText = article.textContent ?? "";
+      const memberMatch = bodyText.match(/([\d,.]+[Kk]?)\s*(สมาชิก|member)/i);
+      const privacy = /สาธารณะ|public/i.test(bodyText) ? "public" : /ส่วนตัว|private/i.test(bodyText) ? "private" : null;
+      return { name: groupName, url: groupUrl, memberCount: memberMatch ? memberMatch[1] : null, privacy };
+    });
+  });
+  void SKIP; // suppress unused warning
+  const groups = (raw.filter(Boolean) as GroupSearchResult[]).filter((r, i, arr) => arr.findIndex((x) => x.url === r.url) === i);
+  onProgress({ type: "info", message: `พบ ${groups.length} กลุ่ม` });
+  return groups;
+}
+
+async function p2_comment(page: Page, posts: PostResult[], text: string, accountId: string, stats: AutoResult, onProgress: (ev: AutoProgressEvent) => void): Promise<void> {
+  onProgress({ type: "info", message: `💬 Phase 2: Comment on ${posts.length} posts` });
+  for (const post of posts) {
+    try {
+      if (!post.url) { stats.errors++; continue; }
+      onProgress({ type: "commenting", message: `💬 คอมเม้น: "${post.text.slice(0, 60)}..."` });
+      await page.goto(post.url, { waitUntil: "networkidle2" });
+      const box = await page.$('[aria-label="แสดงความคิดเห็น..."], [aria-label="Write a comment…"], [aria-label="Write a public comment…"]');
+      if (!box) throw new Error("ไม่พบ comment box");
+      await box.click();
+      await page.keyboard.type(text, { delay: 60 });
+      await page.keyboard.press("Enter");
+      await new Promise((r) => setTimeout(r, 2000));
+      saveComment(accountId, { postId: post.postId, url: post.url, comment: text, commentedAt: new Date().toISOString() });
+      stats.commented++;
+      onProgress({ type: "success", message: `✅ คอมเม้นสำเร็จ (${stats.commented})` });
+      await new Promise((r) => setTimeout(r, 3000 + Math.random() * 2000));
+    } catch (err) {
+      stats.errors++;
+      onProgress({ type: "error", message: `❌ ${err instanceof Error ? err.message : "error"}` });
+    }
+  }
+}
+
+async function p2_like(page: Page, posts: PostResult[], accountId: string, stats: AutoResult, onProgress: (ev: AutoProgressEvent) => void): Promise<void> {
+  onProgress({ type: "info", message: `👍 Phase 2: Like ${posts.length} posts` });
+  for (const post of posts) {
+    try {
+      if (!post.url) { stats.errors++; continue; }
+      const likeKey = `like_${post.postId}`;
+      if (hasCommented(accountId, likeKey)) {
+        stats.skipped_duplicate++;
+        onProgress({ type: "skip", message: `⏭ Like ซ้ำ: "${post.text.slice(0, 50)}..."` });
+        continue;
+      }
+      onProgress({ type: "commenting", message: `👍 กด Like: "${post.text.slice(0, 60)}..."` });
+      await page.goto(post.url, { waitUntil: "networkidle2" });
+      const liked: boolean = await page.evaluate(() => {
+        const labels = ["Like", "ถูกใจ"];
+        const btns = Array.from(document.querySelectorAll('[role="button"]'));
+        for (const lbl of labels) {
+          const btn = btns.find((b) => b.getAttribute("aria-label") === lbl || b.textContent?.trim() === lbl);
+          if (btn) { (btn as HTMLElement).click(); return true; }
+        }
+        return false;
+      });
+      if (!liked) throw new Error("ไม่พบปุ่ม Like");
+      await new Promise((r) => setTimeout(r, 1500));
+      saveComment(accountId, { postId: likeKey, url: post.url, comment: "__liked__", commentedAt: new Date().toISOString() });
+      stats.commented++;
+      onProgress({ type: "success", message: `✅ Like สำเร็จ (${stats.commented})` });
+      await new Promise((r) => setTimeout(r, 2000 + Math.random() * 1000));
+    } catch (err) {
+      stats.errors++;
+      onProgress({ type: "error", message: `❌ ${err instanceof Error ? err.message : "error"}` });
+    }
+  }
+}
+
+async function p2_join_group(page: Page, groups: GroupSearchResult[], accountId: string, stats: AutoResult, onProgress: (ev: AutoProgressEvent) => void): Promise<void> {
+  onProgress({ type: "info", message: `🤝 Phase 2: Join ${groups.length} groups` });
+  for (const group of groups) {
+    try {
+      onProgress({ type: "commenting", message: `🤝 Join: "${group.name || group.url}"` });
+      await page.goto(group.url, { waitUntil: "domcontentloaded", timeout: 30000 });
+      await new Promise((r) => setTimeout(r, 4000));
+      const bodyText: string = await page.evaluate(() => document.body.textContent ?? "");
+      if (/ออกจากกลุ่ม|Leave group/i.test(bodyText)) {
+        stats.skipped_duplicate++;
+        onProgress({ type: "skip", message: `⏭ เป็นสมาชิกอยู่แล้ว: "${group.name}"` });
+        continue;
+      }
+      if (/ยกเลิกคำขอ|Cancel request/i.test(bodyText)) {
+        stats.skipped_duplicate++;
+        onProgress({ type: "skip", message: `⏭ รออนุมัติ: "${group.name}"` });
+        continue;
+      }
+      const clicked: boolean = await page.evaluate(() => {
+        const texts = ["ขอเข้าร่วม", "Join group", "Join Group"];
+        const btns = Array.from(document.querySelectorAll('[role="button"]'));
+        for (const t of texts) {
+          const btn = btns.find((b) => b.textContent?.trim().includes(t));
+          if (btn) { (btn as HTMLElement).click(); return true; }
+        }
+        return false;
+      });
+      if (!clicked) { stats.errors++; onProgress({ type: "error", message: `❌ ไม่พบปุ่ม Join: "${group.name}"` }); continue; }
+      await new Promise((r) => setTimeout(r, 2000));
+      await page.evaluate(() => {
+        const texts = ["ยืนยัน", "Confirm", "ส่งคำขอ", "Send request"];
+        const btns = Array.from(document.querySelectorAll('[role="button"]'));
+        for (const t of texts) {
+          const btn = btns.find((b) => b.textContent?.trim().includes(t));
+          if (btn) { (btn as HTMLElement).click(); return; }
+        }
+      });
+      await new Promise((r) => setTimeout(r, 2000));
+      stats.commented++;
+      onProgress({ type: "success", message: `✅ ขอเข้าร่วม: "${group.name}" (${stats.commented})` });
+      await new Promise((r) => setTimeout(r, 2000 + Math.random() * 1000));
+    } catch (err) {
+      stats.errors++;
+      onProgress({ type: "error", message: `❌ ${err instanceof Error ? err.message : "error"}` });
+    }
+  }
+}
+
+export async function runPipelineJob(
+  job: PipelineJob,
+  onProgress: (ev: AutoProgressEvent) => void
+): Promise<AutoResult> {
+  const { headless, max_posts, scroll_speed_ms } = loadSettings();
+  const { browser, page } = await launchBrowser(job.accountId, headless);
+  const stats: AutoResult = { commented: 0, skipped_keyword: 0, skipped_duplicate: 0, errors: 0 };
+
+  try {
+    await ensureLoggedIn(page, job.accountId);
+
+    // ── Phase 1 ──
+    let posts: PostResult[] = [];
+    let groups: GroupSearchResult[] = [];
+    const p1 = job.phase1;
+
+    if (p1.type === "scroll_feed") {
+      posts = await p1_scroll_feed(page, p1.criteria, max_posts, scroll_speed_ms, job.accountId, stats, onProgress);
+    } else if (p1.type === "search_posts") {
+      posts = await p1_search_posts(page, p1.query, p1.criteria, max_posts, scroll_speed_ms, job.accountId, stats, onProgress);
+    } else if (p1.type === "search_groups") {
+      groups = await p1_search_groups(page, p1.query, onProgress);
+    } else if (p1.type === "direct_url") {
+      if (job.phase2.type === "join_group") {
+        groups = [{ name: p1.url, url: p1.url, memberCount: null, privacy: null }];
+        onProgress({ type: "info", message: `🔗 Phase 1: Direct URL — ${p1.url}` });
+      } else {
+        posts = await p1_direct_url(page, p1.url, p1.criteria, max_posts, scroll_speed_ms, job.accountId, stats, onProgress);
+      }
+    }
+
+    onProgress({
+      type: "info",
+      message: `Phase 1 เสร็จ — พบ ${posts.length > 0 ? `${posts.length} โพสต์` : `${groups.length} กลุ่ม`}`,
+    });
+
+    // ── Phase 2 ──
+    const p2 = job.phase2;
+    if (p2.type === "comment") {
+      let commentText = p2.text;
+      if (p2.criteriaId) {
+        const { db } = await import("./db");
+        const row = db
+          .prepare(`SELECT comment_text FROM comment_pool WHERE criteria_id = ? AND status = 'active' ORDER BY RANDOM() LIMIT 1`)
+          .get(p2.criteriaId) as { comment_text: string } | undefined;
+        if (row) {
+          commentText = row.comment_text;
+          onProgress({ type: "info", message: `🎲 เลือก comment จาก criteria: "${commentText.slice(0, 50)}"` });
+        } else {
+          onProgress({ type: "error", message: "⚠️ ไม่มี comment ใน criteria — ใช้ข้อความสำรอง" });
+        }
+      }
+      await p2_comment(page, posts, commentText, job.accountId, stats, onProgress);
+    } else if (p2.type === "like") {
+      await p2_like(page, posts, job.accountId, stats, onProgress);
+    } else if (p2.type === "join_group") {
+      await p2_join_group(page, groups, job.accountId, stats, onProgress);
+    }
+
+    return stats;
+  } finally {
+    await browser.close();
   }
 }
 

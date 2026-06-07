@@ -84,6 +84,21 @@ const BOOTSTRAP_SQL = `
     requested_at TEXT    NOT NULL DEFAULT (datetime('now'))
   );
   CREATE INDEX IF NOT EXISTS idx_group_join_url ON group_join_history(group_url);
+  CREATE TABLE IF NOT EXISTS comment_criteria (
+    id          INTEGER PRIMARY KEY AUTOINCREMENT,
+    name        TEXT    NOT NULL,
+    description TEXT,
+    created_at  TEXT    NOT NULL DEFAULT (datetime('now')),
+    updated_at  TEXT    NOT NULL DEFAULT (datetime('now'))
+  );
+  CREATE TABLE IF NOT EXISTS comment_pool (
+    id           INTEGER PRIMARY KEY AUTOINCREMENT,
+    criteria_id  INTEGER NOT NULL REFERENCES comment_criteria(id) ON DELETE CASCADE,
+    comment_text TEXT    NOT NULL,
+    status       TEXT    NOT NULL DEFAULT 'active',
+    created_at   TEXT    NOT NULL DEFAULT (datetime('now'))
+  );
+  CREATE INDEX IF NOT EXISTS idx_comment_pool_criteria ON comment_pool(criteria_id);
 `
 
 declare const globalThis: { _agentDb?: DatabaseType } & typeof global

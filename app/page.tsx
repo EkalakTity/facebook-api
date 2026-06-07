@@ -20,6 +20,19 @@ interface GroupSearchResult {
   memberCount: string | null;
   privacy: "public" | "private" | null;
 }
+type Phase1Type = "scroll_feed" | "search_posts" | "search_groups" | "direct_url";
+type Phase2Type = "comment" | "join_group" | "like";
+interface PipelineJob {
+  id: string;
+  name: string;
+  accountId: string;
+  phase1: { type: Phase1Type; query?: string; url?: string; criteria?: string[] };
+  phase2: { type: Phase2Type; text?: string; criteriaId?: number };
+  enabled: boolean;
+  intervalHours: number;
+  lastRunAt?: string;
+}
+interface CommentCriteria { id: number; name: string; comment_count: number }
 interface GroupJoinRecord {
   id: number;
   group_name: string;
@@ -44,7 +57,7 @@ interface QueueItem {
 export default function Dashboard() {
   const [accounts, setAccounts] = useState<Account[]>([]);
   const [selectedId, setSelectedId] = useState("");
-  const [activeTab, setActiveTab] = useState<"accounts" | "feed" | "chat" | "groups" | "auto" | "history" | "queue">("accounts");
+  const [activeTab, setActiveTab] = useState<"accounts" | "feed" | "chat" | "groups" | "auto" | "search-comment" | "history" | "queue">("accounts");
 
   // accounts tab state
   const [sessions, setSessions] = useState<Record<string, SessionInfo>>({});
@@ -79,6 +92,12 @@ export default function Dashboard() {
   const [groupSelectedAccounts, setGroupSelectedAccounts] = useState<Set<string>>(new Set());
   const [groupHistory, setGroupHistory] = useState<GroupJoinRecord[]>([]);
 
+  // Join by URL state
+  const [directUrl, setDirectUrl] = useState("");
+  const [directJoinLoading, setDirectJoinLoading] = useState(false);
+  const [directJoinStatus, setDirectJoinStatus] = useState<Record<string, string>>({}); // accountId → status
+  const [directJoinError, setDirectJoinError] = useState("");
+
   // Queue tab state
   const [queueItems, setQueueItems] = useState<QueueItem[]>([]);
   const [queueConnected, setQueueConnected] = useState(false);
@@ -89,13 +108,38 @@ export default function Dashboard() {
   const [autoLog, setAutoLog] = useState<LogEntry[]>([]);
   const [autoStats, setAutoStats] = useState<{ commented: number; skipped_keyword: number; skipped_duplicate: number; errors: number } | null>(null);
 
+  // Comment criteria for random comment
+  const [commentCriteria, setCommentCriteria] = useState<CommentCriteria[]>([]);
+  const [pbCriteriaId, setPbCriteriaId] = useState<number | null>(null);
+  const [pbCommentMode, setPbCommentMode] = useState<"text" | "criteria">("text");
+
+  // Pipeline builder state
+  const [pbAccountId, setPbAccountId] = useState("");
+  const [pbName, setPbName] = useState("");
+  const [pbPhase1, setPbPhase1] = useState<Phase1Type>("search_posts");
+  const [pbQuery, setPbQuery] = useState("");
+  const [pbUrl, setPbUrl] = useState("");
+  const [pbCriteria, setPbCriteria] = useState("");
+  const [pbPhase2, setPbPhase2] = useState<Phase2Type>("comment");
+  const [pbText, setPbText] = useState("");
+  const [pbInterval, setPbInterval] = useState(1);
+  const [pbRunning, setPbRunning] = useState(false);
+  const [pbLog, setPbLog] = useState<LogEntry[]>([]);
+  const [pbStats, setPbStats] = useState<{ commented: number; skipped_keyword: number; skipped_duplicate: number; errors: number } | null>(null);
+
+  // Scheduled pipeline jobs
+  const [scJobs, setScJobs] = useState<PipelineJob[]>([]);
+  const [scJobRunning, setScJobRunning] = useState<Record<string, boolean>>({});
+  const [scJobLog, setScJobLog] = useState<Record<string, LogEntry[]>>({});
+  const [scSaving, setScSaving] = useState(false);
+
   useEffect(() => {
     fetch("/api/settings")
       .then((r) => r.json())
       .then(async (data) => {
         const accs: Account[] = data.accounts ?? [];
         setAccounts(accs);
-        if (accs.length > 0) setSelectedId(accs[0].id);
+        if (accs.length > 0) { setSelectedId(accs[0].id); setPbAccountId(accs[0].id); }
         setGroupSelectedAccounts(new Set(accs.map((a) => a.id)));
         // load session info for all accounts
         const map: Record<string, SessionInfo> = {};
@@ -113,6 +157,14 @@ export default function Dashboard() {
     fetch("/api/groups/history")
       .then((r) => r.json())
       .then((data) => setGroupHistory(data.records ?? []));
+    // load scheduled jobs
+    fetch("/api/jobs")
+      .then((r) => r.json())
+      .then((data) => setScJobs(data.jobs ?? []));
+    // load comment criteria
+    fetch("/api/comment-criteria")
+      .then((r) => r.json())
+      .then((data) => setCommentCriteria(data.criteria ?? []));
   }, []);
 
   // โหลด history ทุกครั้งที่เปลี่ยน account
@@ -384,6 +436,144 @@ export default function Dashboard() {
     fetch("/api/groups/history").then((r) => r.json()).then((d) => setGroupHistory(d.records ?? []));
   }
 
+  function buildPipelineJob(): PipelineJob | null {
+    if (!pbAccountId) return null;
+    const criteria = pbCriteria.split(",").map((s) => s.trim()).filter(Boolean);
+    let phase1: PipelineJob["phase1"];
+    if (pbPhase1 === "scroll_feed") phase1 = { type: "scroll_feed", criteria };
+    else if (pbPhase1 === "search_posts") { if (!pbQuery.trim()) return null; phase1 = { type: "search_posts", query: pbQuery.trim(), criteria }; }
+    else if (pbPhase1 === "search_groups") { if (!pbQuery.trim()) return null; phase1 = { type: "search_groups", query: pbQuery.trim() }; }
+    else { if (!pbUrl.trim()) return null; phase1 = { type: "direct_url", url: pbUrl.trim(), criteria }; }
+
+    let phase2: PipelineJob["phase2"];
+    if (pbPhase2 === "comment") {
+      if (pbCommentMode === "criteria") {
+        if (!pbCriteriaId) return null;
+        phase2 = { type: "comment", text: "", criteriaId: pbCriteriaId };
+      } else {
+        if (!pbText.trim()) return null;
+        phase2 = { type: "comment", text: pbText.trim() };
+      }
+    } else if (pbPhase2 === "join_group") phase2 = { type: "join_group" };
+    else phase2 = { type: "like" };
+
+    return { id: "", name: pbName.trim() || `${pbPhase1} → ${pbPhase2}`, accountId: pbAccountId, phase1, phase2, enabled: true, intervalHours: pbInterval };
+  }
+
+  function startPipelineRun() {
+    const job = buildPipelineJob();
+    if (!job || pbRunning) return;
+    setPbRunning(true);
+    setPbLog([]);
+    setPbStats(null);
+
+    const encoded = btoa(JSON.stringify(job));
+    const es = new EventSource(`/api/pipeline/run?job=${encoded}`);
+    es.onmessage = (e) => {
+      const data = JSON.parse(e.data);
+      if (data.type === "done") {
+        setPbStats({ commented: data.commented, skipped_keyword: data.skipped_keyword, skipped_duplicate: data.skipped_duplicate, errors: data.errors });
+        setPbRunning(false);
+        es.close();
+        fetch(`/api/history?accountId=${selectedId}`).then(r => r.json()).then((records: CommentRecord[]) => {
+          setHistory(records);
+          setCommentedIds(new Set(records.map((r) => r.postId)));
+        });
+      } else if (data.type === "fatal") {
+        setPbLog((l) => [...l, { type: "fatal", message: `❌ ${data.message}` }]);
+        setPbRunning(false);
+        es.close();
+      } else {
+        setPbLog((l) => [...l, data]);
+      }
+    };
+    es.onerror = () => { setPbLog((l) => [...l, { type: "error", message: "Connection ขาด" }]); setPbRunning(false); es.close(); };
+  }
+
+  async function saveScJob() {
+    const job = buildPipelineJob();
+    if (!job) return;
+    setScSaving(true);
+    try {
+      const res = await fetch("/api/jobs", {
+        method: "POST",
+        headers: { "Content-Type": "application/json" },
+        body: JSON.stringify({ ...job, intervalHours: pbInterval }),
+      });
+      const data = await res.json();
+      setScJobs(data.jobs ?? []);
+    } finally {
+      setScSaving(false);
+    }
+  }
+
+  async function toggleScJob(job: PipelineJob) {
+    const res = await fetch("/api/jobs", {
+      method: "POST",
+      headers: { "Content-Type": "application/json" },
+      body: JSON.stringify({ id: job.id, enabled: !job.enabled }),
+    });
+    const data = await res.json();
+    setScJobs(data.jobs ?? []);
+  }
+
+  async function deleteScJob(id: string) {
+    const res = await fetch(`/api/jobs?id=${id}`, { method: "DELETE" });
+    const data = await res.json();
+    setScJobs(data.jobs ?? []);
+  }
+
+  function runScJobNow(job: PipelineJob) {
+    if (scJobRunning[job.id]) return;
+    setScJobRunning((s) => ({ ...s, [job.id]: true }));
+    setScJobLog((s) => ({ ...s, [job.id]: [] }));
+
+    const es = new EventSource(`/api/jobs/run?id=${job.id}`);
+    es.onmessage = (e) => {
+      const data = JSON.parse(e.data);
+      if (data.type === "done" || data.type === "fatal") {
+        setScJobRunning((s) => ({ ...s, [job.id]: false }));
+        es.close();
+        // refresh lastRunAt
+        fetch("/api/jobs").then((r) => r.json()).then((d) => setScJobs(d.jobs ?? []));
+      }
+      setScJobLog((s) => ({ ...s, [job.id]: [...(s[job.id] ?? []), data] }));
+    };
+    es.onerror = () => {
+      setScJobRunning((s) => ({ ...s, [job.id]: false }));
+      es.close();
+    };
+  }
+
+  async function doJoinByUrl() {
+    const url = directUrl.trim();
+    if (!url) return;
+    const targets = accounts.filter((a) => groupSelectedAccounts.has(a.id));
+    if (targets.length === 0) return;
+
+    setDirectJoinLoading(true);
+    setDirectJoinStatus({});
+    setDirectJoinError("");
+
+    for (const acc of targets) {
+      try {
+        const res = await fetch("/api/groups/join", {
+          method: "POST",
+          headers: { "Content-Type": "application/json" },
+          body: JSON.stringify({ groupUrl: url, groupName: url, accountId: acc.id }),
+        });
+        const data = await res.json();
+        const status = data.success ? data.status : (data.error ?? "error");
+        setDirectJoinStatus((s) => ({ ...s, [acc.id]: status }));
+      } catch {
+        setDirectJoinStatus((s) => ({ ...s, [acc.id]: "error" }));
+      }
+    }
+
+    setDirectJoinLoading(false);
+    fetch("/api/groups/history").then((r) => r.json()).then((d) => setGroupHistory(d.records ?? []));
+  }
+
   const selectedAccount = accounts.find((a) => a.id === selectedId);
 
   return (
@@ -412,7 +602,7 @@ export default function Dashboard() {
 
       {/* Tabs */}
       <div className="flex flex-wrap gap-2 mb-6">
-        {(["accounts", "feed", "chat", "groups", "auto", "history", "queue"] as const).map((tab) => (
+        {(["accounts", "feed", "chat", "groups", "auto", "search-comment", "history", "queue"] as const).map((tab) => (
           <button key={tab} onClick={() => setActiveTab(tab)}
             className={`px-4 py-2 rounded-lg text-sm font-medium transition ${activeTab === tab ? "bg-blue-600 text-white" : "bg-gray-800 text-gray-400 hover:bg-gray-700"}`}>
             {tab === "accounts" ? `👥 บัญชี (${accounts.length})` :
@@ -420,6 +610,7 @@ export default function Dashboard() {
              tab === "chat" ? "💬 ค้นหาแชท" :
              tab === "groups" ? "🔍 ขอเข้ากลุ่ม" :
              tab === "auto" ? "🤖 Auto Comment" :
+             tab === "search-comment" ? "🔍💬 ค้นหา & คอมเม้น" :
              tab === "history" ? `📋 ประวัติ (${history.length})` :
              <span className="flex items-center gap-1.5">
                📬 Review Queue
@@ -767,6 +958,50 @@ export default function Dashboard() {
             {groupSearchError && <p className="text-red-400 text-sm">❌ {groupSearchError}</p>}
           </div>
 
+          {/* Join by URL */}
+          <div className="bg-gray-900 rounded-xl p-5 border border-gray-800 space-y-3">
+            <h3 className="font-semibold text-sm text-gray-200">🔗 เข้ากลุ่มด้วย URL โดยตรง</h3>
+            <div className="flex gap-3">
+              <input
+                type="text"
+                value={directUrl}
+                onChange={(e) => { setDirectUrl(e.target.value); setDirectJoinStatus({}); setDirectJoinError(""); }}
+                onKeyDown={(e) => e.key === "Enter" && doJoinByUrl()}
+                placeholder="https://www.facebook.com/groups/..."
+                className="flex-1 bg-gray-800 border border-gray-700 rounded-lg px-4 py-2 text-sm focus:outline-none focus:border-blue-500 placeholder-gray-500 font-mono"
+              />
+              <button
+                onClick={doJoinByUrl}
+                disabled={directJoinLoading || !directUrl.trim() || groupSelectedAccounts.size === 0}
+                className="bg-blue-600 hover:bg-blue-700 disabled:opacity-50 disabled:cursor-not-allowed px-5 py-2 rounded-lg text-sm font-medium transition whitespace-nowrap"
+              >
+                {directJoinLoading ? "⏳ กำลัง Join..." : "ขอเข้าร่วม"}
+              </button>
+            </div>
+            {directJoinError && <p className="text-red-400 text-sm">❌ {directJoinError}</p>}
+            {Object.keys(directJoinStatus).length > 0 && (
+              <div className="flex flex-wrap gap-2 pt-1">
+                {accounts.filter((a) => directJoinStatus[a.id]).map((acc) => {
+                  const s = directJoinStatus[acc.id];
+                  const cls =
+                    s === "request_sent"   ? "bg-yellow-900/50 text-yellow-400 border-yellow-700" :
+                    s === "joined"         ? "bg-green-900/50  text-green-400  border-green-700"  :
+                    s === "already_member" ? "bg-blue-900/50   text-blue-400   border-blue-700"   :
+                                            "bg-red-900/50    text-red-400    border-red-700";
+                  const label =
+                    s === "request_sent"   ? "รอ Approve" :
+                    s === "joined"         ? "เข้าร่วมแล้ว" :
+                    s === "already_member" ? "เป็นสมาชิกอยู่แล้ว" : s;
+                  return (
+                    <span key={acc.id} className={`text-xs px-2 py-0.5 rounded-full border ${cls}`}>
+                      👤 {acc.label}: {label}
+                    </span>
+                  );
+                })}
+              </div>
+            )}
+          </div>
+
           {/* Account selector — shown when 2+ accounts exist */}
           {accounts.length > 1 && (
             <div className="bg-gray-900 border border-gray-800 rounded-xl p-4 space-y-2">
@@ -965,6 +1200,303 @@ export default function Dashboard() {
               </div>
             </div>
           )}
+        </div>
+      )}
+
+      {/* Pipeline Jobs tab */}
+      {activeTab === "search-comment" && (
+        <div className="space-y-4">
+
+          {/* Builder */}
+          <div className="bg-gray-900 rounded-xl p-5 border border-gray-800 space-y-5">
+            <h2 className="font-semibold text-lg">⚙️ สร้าง Pipeline Job</h2>
+
+            <div className="grid grid-cols-1 sm:grid-cols-2 gap-3">
+              <div>
+                <label className="text-xs text-gray-400 block mb-1">ชื่อ Job (ไม่บังคับ)</label>
+                <input type="text" value={pbName} onChange={(e) => setPbName(e.target.value)}
+                  placeholder="เช่น หาคนขายบ้าน แล้วคอมเม้น"
+                  className="w-full bg-gray-800 border border-gray-700 rounded-lg px-4 py-2 text-sm focus:outline-none focus:border-blue-500 placeholder-gray-500" />
+              </div>
+              <div>
+                <label className="text-xs text-gray-400 block mb-1">บัญชีที่ใช้ *</label>
+                {accounts.length === 0 ? (
+                  <p className="text-xs text-gray-500 mt-2">ยังไม่มีบัญชี — <a href="/settings" className="text-blue-400 underline">เพิ่มที่ Settings</a></p>
+                ) : (
+                  <div className="flex flex-wrap gap-2">
+                    {accounts.map((acc) => (
+                      <button key={acc.id} onClick={() => setPbAccountId(acc.id)}
+                        className={`flex items-center gap-1.5 px-3 py-1.5 rounded-lg text-sm border transition ${
+                          pbAccountId === acc.id
+                            ? "bg-blue-600 border-blue-500 text-white"
+                            : "bg-gray-800 border-gray-700 text-gray-300 hover:bg-gray-700"
+                        }`}>
+                        <span className={`w-2 h-2 rounded-full ${pbAccountId === acc.id ? "bg-white" : "bg-gray-600"}`} />
+                        {acc.label}
+                      </button>
+                    ))}
+                  </div>
+                )}
+              </div>
+            </div>
+
+            {/* Phase 1 */}
+            <div className="space-y-3">
+              <p className="text-xs font-semibold text-blue-400 uppercase tracking-wider">Phase 1 — หาเป้าหมาย</p>
+              <div className="grid grid-cols-2 sm:grid-cols-4 gap-2">
+                {([
+                  { value: "scroll_feed",   label: "📜 Scroll Feed",   desc: "scroll หน้า feed ปกติ" },
+                  { value: "search_posts",  label: "🔍 Search Posts",  desc: "ค้นหาโพสต์ด้วย query" },
+                  { value: "search_groups", label: "👥 Search Groups", desc: "ค้นหากลุ่มด้วย query" },
+                  { value: "direct_url",    label: "🔗 Direct URL",    desc: "ระบุ URL กลุ่ม/เพจ" },
+                ] as { value: Phase1Type; label: string; desc: string }[]).map((opt) => (
+                  <button key={opt.value} onClick={() => setPbPhase1(opt.value)}
+                    className={`p-3 rounded-lg border text-left transition ${pbPhase1 === opt.value ? "bg-blue-900/50 border-blue-500 text-blue-200" : "bg-gray-800 border-gray-700 text-gray-400 hover:border-gray-500"}`}>
+                    <p className="text-sm font-medium">{opt.label}</p>
+                    <p className="text-xs opacity-60 mt-0.5">{opt.desc}</p>
+                  </button>
+                ))}
+              </div>
+              {(pbPhase1 === "search_posts" || pbPhase1 === "search_groups") && (
+                <div>
+                  <label className="text-xs text-gray-400 block mb-1">Search Query *</label>
+                  <input type="text" value={pbQuery} onChange={(e) => setPbQuery(e.target.value)}
+                    placeholder={pbPhase1 === "search_groups" ? "เช่น ขายบ้าน, เติมเกม..." : "เช่น รับสมัครงาน, ขายที่ดิน..."}
+                    className="w-full bg-gray-800 border border-gray-700 rounded-lg px-4 py-2 text-sm focus:outline-none focus:border-blue-500 placeholder-gray-500" />
+                </div>
+              )}
+              {pbPhase1 === "direct_url" && (
+                <div>
+                  <label className="text-xs text-gray-400 block mb-1">URL *</label>
+                  <input type="text" value={pbUrl} onChange={(e) => setPbUrl(e.target.value)}
+                    placeholder="https://www.facebook.com/groups/..."
+                    className="w-full bg-gray-800 border border-gray-700 rounded-lg px-4 py-2 text-sm font-mono focus:outline-none focus:border-blue-500 placeholder-gray-500" />
+                </div>
+              )}
+              {pbPhase1 !== "search_groups" && (
+                <div>
+                  <label className="text-xs text-gray-400 block mb-1">
+                    Criteria Keywords — คั่นด้วยจุลภาค
+                    <span className="text-gray-600 ml-1">(ว่าง = ทุกโพสต์)</span>
+                  </label>
+                  <input type="text" value={pbCriteria} onChange={(e) => setPbCriteria(e.target.value)}
+                    placeholder="เช่น ราคา, สนใจ, ติดต่อ"
+                    className="w-full bg-gray-800 border border-gray-700 rounded-lg px-4 py-2 text-sm focus:outline-none focus:border-blue-500 placeholder-gray-500" />
+                </div>
+              )}
+            </div>
+
+            {/* Phase 2 */}
+            <div className="space-y-3">
+              <p className="text-xs font-semibold text-purple-400 uppercase tracking-wider">Phase 2 — Action</p>
+              <div className="grid grid-cols-3 gap-2">
+                {([
+                  { value: "comment",    label: "💬 Comment",    desc: "คอมเม้นบนโพสต์" },
+                  { value: "join_group", label: "🤝 Join Group", desc: "ขอเข้าร่วมกลุ่ม" },
+                  { value: "like",       label: "👍 Like",       desc: "กด Like โพสต์" },
+                ] as { value: Phase2Type; label: string; desc: string }[]).map((opt) => (
+                  <button key={opt.value} onClick={() => setPbPhase2(opt.value)}
+                    className={`p-3 rounded-lg border text-left transition ${pbPhase2 === opt.value ? "bg-purple-900/50 border-purple-500 text-purple-200" : "bg-gray-800 border-gray-700 text-gray-400 hover:border-gray-500"}`}>
+                    <p className="text-sm font-medium">{opt.label}</p>
+                    <p className="text-xs opacity-60 mt-0.5">{opt.desc}</p>
+                  </button>
+                ))}
+              </div>
+              {pbPhase2 === "comment" && (
+                <div className="space-y-3">
+                  {/* Mode toggle */}
+                  <div className="flex gap-2">
+                    <button
+                      onClick={() => setPbCommentMode("text")}
+                      className={`flex-1 py-2 rounded-lg text-xs font-medium border transition ${pbCommentMode === "text" ? "bg-blue-900/50 border-blue-500 text-blue-200" : "bg-gray-800 border-gray-700 text-gray-400 hover:border-gray-500"}`}
+                    >
+                      ✏️ พิมพ์ข้อความ
+                    </button>
+                    <button
+                      onClick={() => setPbCommentMode("criteria")}
+                      className={`flex-1 py-2 rounded-lg text-xs font-medium border transition ${pbCommentMode === "criteria" ? "bg-purple-900/50 border-purple-500 text-purple-200" : "bg-gray-800 border-gray-700 text-gray-400 hover:border-gray-500"}`}
+                    >
+                      🎲 สุ่มจาก Criteria
+                    </button>
+                  </div>
+
+                  {pbCommentMode === "text" ? (
+                    <div>
+                      <label className="text-xs text-gray-400 block mb-1">ข้อความคอมเม้น *</label>
+                      <textarea value={pbText} onChange={(e) => setPbText(e.target.value)}
+                        placeholder="ข้อความที่จะใช้คอมเม้น..." rows={3}
+                        className="w-full bg-gray-800 border border-gray-700 rounded-lg px-4 py-2 text-sm focus:outline-none focus:border-blue-500 placeholder-gray-500 resize-none" />
+                    </div>
+                  ) : (
+                    <div>
+                      <label className="text-xs text-gray-400 block mb-1">เลือก Criteria *</label>
+                      {commentCriteria.length === 0 ? (
+                        <p className="text-xs text-gray-500">
+                          ยังไม่มี Criteria — <a href="/settings" className="text-purple-400 underline">สร้างที่ Settings</a>
+                        </p>
+                      ) : (
+                        <div className="flex flex-wrap gap-2">
+                          {commentCriteria.map((c) => (
+                            <button key={c.id} onClick={() => setPbCriteriaId(c.id)}
+                              className={`px-3 py-1.5 rounded-lg text-xs border transition ${pbCriteriaId === c.id ? "bg-purple-900/50 border-purple-500 text-purple-200" : "bg-gray-800 border-gray-700 text-gray-300 hover:border-gray-500"}`}>
+                              🎲 {c.name}
+                              <span className="ml-1.5 text-gray-500">({c.comment_count})</span>
+                            </button>
+                          ))}
+                        </div>
+                      )}
+                    </div>
+                  )}
+                </div>
+              )}
+            </div>
+
+            {/* Interval + Action buttons */}
+            <div className="flex items-center gap-4 flex-wrap pt-1 border-t border-gray-800">
+              <div className="flex items-center gap-2">
+                <label className="text-xs text-gray-400 whitespace-nowrap">รันทุก</label>
+                <input type="number" min={1} max={24} value={pbInterval} onChange={(e) => setPbInterval(Number(e.target.value))}
+                  className="w-16 bg-gray-800 border border-gray-700 rounded-lg px-2 py-1.5 text-sm text-center focus:outline-none focus:border-blue-500" />
+                <span className="text-xs text-gray-400">ชั่วโมง</span>
+              </div>
+              <div className="flex gap-2 flex-wrap">
+                <button onClick={startPipelineRun} disabled={pbRunning || !selectedId}
+                  className="bg-green-600 hover:bg-green-700 disabled:opacity-50 disabled:cursor-not-allowed px-5 py-2 rounded-lg text-sm font-semibold transition">
+                  {pbRunning ? "⏳ กำลังทำงาน..." : "▶ รันเดี่ยว"}
+                </button>
+                <button onClick={saveScJob} disabled={scSaving || !selectedId}
+                  className="bg-purple-600 hover:bg-purple-700 disabled:opacity-50 disabled:cursor-not-allowed px-5 py-2 rounded-lg text-sm font-semibold transition">
+                  {scSaving ? "⏳ บันทึก..." : "⏰ บันทึกเป็น Job"}
+                </button>
+              </div>
+            </div>
+          </div>
+
+          {/* One-off stats */}
+          {pbStats && (
+            <div className="grid grid-cols-4 gap-3">
+              {[
+                { label: "Action สำเร็จ", value: pbStats.commented, color: "text-green-400" },
+                { label: "ข้ามซ้ำ", value: pbStats.skipped_duplicate, color: "text-yellow-400" },
+                { label: "ไม่ตรงเกณฑ์", value: pbStats.skipped_keyword, color: "text-gray-400" },
+                { label: "Error", value: pbStats.errors, color: "text-red-400" },
+              ].map((s) => (
+                <div key={s.label} className="bg-gray-900 border border-gray-800 rounded-xl p-3 text-center">
+                  <p className={`text-2xl font-bold ${s.color}`}>{s.value}</p>
+                  <p className="text-xs text-gray-500 mt-1">{s.label}</p>
+                </div>
+              ))}
+            </div>
+          )}
+
+          {/* One-off live log */}
+          {pbLog.length > 0 && (
+            <div className="bg-gray-950 border border-gray-800 rounded-xl p-4 space-y-1 max-h-64 overflow-y-auto font-mono">
+              {pbLog.map((entry, i) => (
+                <p key={i} className={`text-xs ${
+                  entry.type === "success"    ? "text-green-400"  :
+                  entry.type === "found"      ? "text-blue-400"   :
+                  entry.type === "error" || entry.type === "fatal" ? "text-red-400" :
+                  entry.type === "skip"       ? "text-yellow-500" :
+                  entry.type === "commenting" ? "text-purple-400" :
+                  "text-gray-400"
+                }`}>{entry.message}</p>
+              ))}
+              {pbRunning && <p className="text-xs text-gray-600 animate-pulse">กำลังทำงาน...</p>}
+            </div>
+          )}
+
+          {/* Scheduled jobs list */}
+          <div className="space-y-2">
+            <p className="text-xs text-gray-500 font-medium px-1">
+              ⏰ Scheduled Jobs ({scJobs.length} รายการ)
+            </p>
+
+            {scJobs.length === 0 && (
+              <div className="bg-gray-900 border border-gray-800 rounded-xl p-6 text-center text-gray-500 text-sm">
+                ยังไม่มี Job — ตั้งค่า Pipeline แล้วกด "บันทึกเป็น Job"
+              </div>
+            )}
+
+            {scJobs.map((job) => {
+              const acc = accounts.find((a) => a.id === job.accountId);
+              const running = scJobRunning[job.id] ?? false;
+              const log = scJobLog[job.id] ?? [];
+              const nextRun = job.lastRunAt
+                ? new Date(new Date(job.lastRunAt).getTime() + job.intervalHours * 3600_000)
+                : null;
+
+              const p1Label =
+                job.phase1.type === "scroll_feed"   ? "📜 Scroll Feed" :
+                job.phase1.type === "search_posts"  ? `🔍 Search: "${job.phase1.query}"` :
+                job.phase1.type === "search_groups" ? `👥 Groups: "${job.phase1.query}"` :
+                `🔗 URL: ${job.phase1.url?.slice(0, 40)}`;
+
+              const p2Label =
+                job.phase2.type === "comment"
+                  ? job.phase2.criteriaId
+                    ? `🎲 Comment (criteria: ${commentCriteria.find(c => c.id === job.phase2.criteriaId)?.name ?? `#${job.phase2.criteriaId}`})`
+                    : `💬 Comment: "${job.phase2.text?.slice(0, 30)}"`
+                  : job.phase2.type === "join_group" ? "🤝 Join Group"
+                  : "👍 Like";
+
+              return (
+                <div key={job.id} className="bg-gray-900 border border-gray-800 rounded-xl p-4 space-y-3">
+                  <div className="flex items-start gap-3">
+                    <button onClick={() => toggleScJob(job)} title={job.enabled ? "คลิกเพื่อหยุด" : "คลิกเพื่อเปิดใช้"}
+                      className={`mt-0.5 w-10 h-5 rounded-full relative transition-colors shrink-0 ${job.enabled ? "bg-green-600" : "bg-gray-700"}`}>
+                      <span className={`absolute top-0.5 w-4 h-4 rounded-full bg-white transition-all ${job.enabled ? "left-5" : "left-0.5"}`} />
+                    </button>
+
+                    <div className="flex-1 min-w-0 space-y-1">
+                      <p className="text-sm font-medium text-white">{job.name}</p>
+                      <div className="flex flex-wrap gap-2 text-xs">
+                        <span className="bg-blue-900/40 text-blue-300 border border-blue-800 px-2 py-0.5 rounded-full">{p1Label}</span>
+                        <span className="text-gray-500">→</span>
+                        <span className="bg-purple-900/40 text-purple-300 border border-purple-800 px-2 py-0.5 rounded-full">{p2Label}</span>
+                      </div>
+                      <div className="flex flex-wrap gap-x-3 gap-y-0.5 text-xs text-gray-500">
+                        <span>👤 {acc?.label ?? job.accountId}</span>
+                        <span>⏱ ทุก {job.intervalHours} ชม.</span>
+                        {job.phase1.criteria && job.phase1.criteria.length > 0 && (
+                          <span>🎯 {job.phase1.criteria.join(", ")}</span>
+                        )}
+                      </div>
+                      <div className="flex flex-wrap gap-x-3 text-xs">
+                        {job.lastRunAt && <span className="text-gray-500">รันล่าสุด: {new Date(job.lastRunAt).toLocaleString("th-TH")}</span>}
+                        {nextRun && job.enabled && <span className="text-blue-500">รันถัดไป: {nextRun.toLocaleString("th-TH")}</span>}
+                      </div>
+                    </div>
+
+                    <div className="flex items-center gap-2 shrink-0">
+                      <button onClick={() => runScJobNow(job)} disabled={running}
+                        className="text-xs bg-blue-700 hover:bg-blue-600 disabled:opacity-40 text-white px-3 py-1.5 rounded-lg transition whitespace-nowrap">
+                        {running ? "⏳" : "▶ รัน"}
+                      </button>
+                      <button onClick={() => deleteScJob(job.id)} disabled={running}
+                        className="text-gray-600 hover:text-red-400 transition text-base disabled:opacity-40">🗑</button>
+                    </div>
+                  </div>
+
+                  {log.length > 0 && (
+                    <div className="bg-gray-950 rounded-lg p-3 space-y-0.5 max-h-40 overflow-y-auto font-mono">
+                      {log.map((entry, i) => (
+                        <p key={i} className={`text-xs ${
+                          entry.type === "success"    ? "text-green-400"  :
+                          entry.type === "found"      ? "text-blue-400"   :
+                          entry.type === "error" || entry.type === "fatal" ? "text-red-400" :
+                          entry.type === "skip"       ? "text-yellow-500" :
+                          entry.type === "commenting" ? "text-purple-400" :
+                          "text-gray-400"
+                        }`}>{entry.message ?? "✅ เสร็จ"}</p>
+                      ))}
+                      {running && <p className="text-xs text-gray-600 animate-pulse">กำลังทำงาน...</p>}
+                    </div>
+                  )}
+                </div>
+              );
+            })}
+          </div>
         </div>
       )}
 
