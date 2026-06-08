@@ -1,5 +1,12 @@
 import type { Metadata } from "next";
+import { Sarabun } from "next/font/google";
 import "./globals.css";
+
+const sarabun = Sarabun({
+  subsets: ["thai", "latin"],
+  weight: ["400", "500", "700"],
+  variable: "--font-sarabun",
+});
 
 export const metadata: Metadata = {
   title: "FB Automation",
@@ -8,7 +15,7 @@ export const metadata: Metadata = {
 
 export default function RootLayout({ children }: { children: React.ReactNode }) {
   return (
-    <html lang="th">
+    <html lang="th" className={sarabun.variable}>
       <body className="bg-gray-950 text-gray-100 min-h-screen">
         <nav className="bg-gray-900 border-b border-gray-800 px-6 py-3 flex items-center gap-6">
           <span className="text-blue-400 font-bold text-lg">📘 FB Automation</span>
